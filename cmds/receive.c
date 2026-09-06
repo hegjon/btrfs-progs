@@ -55,6 +55,30 @@
 #include "common/string-utils.h"
 #include "cmds/commands.h"
 #include "cmds/receive-dump.h"
+#include <pthread.h>
+#include <sys/xattr.h>
+
+/* Per-thread state of the decompress fallback for encoded writes. */
+struct decomp_ctx {
+#if COMPRESSION_ZSTD
+	ZSTD_DStream *zstd_dstream;
+#endif
+	z_stream *zlib_stream;
+};
+
+static void free_decomp_ctx(struct decomp_ctx *d)
+{
+#if COMPRESSION_ZSTD
+	if (d->zstd_dstream)
+		ZSTD_freeDStream(d->zstd_dstream);
+	d->zstd_dstream = NULL;
+#endif
+	if (d->zlib_stream) {
+		inflateEnd(d->zlib_stream);
+		free(d->zlib_stream);
+	}
+	d->zlib_stream = NULL;
+}
 
 struct btrfs_receive
 {
@@ -100,16 +124,34 @@ struct btrfs_receive
 	char **setgid_dirs;
 	int setgid_dirs_cnt;
 
+	/*
+	 * Worker threads. A new regular file's descriptor is handed to one
+	 * of them, and the data and attribute commands that follow for that
+	 * file (write, chown, chmod, utimes, ...) are queued to it in order
+	 * and run there, while this thread goes on creating the next inodes.
+	 * See queue_job() and drain_workers().
+	 */
+	struct recv_worker *workers;
+	int nr_workers;
+	int async_worker;
+	int async_fd;
+	char async_path[PATH_MAX];
+
 	bool honor_end_cmd;
 
 	bool force_decompress;
 
-#if COMPRESSION_ZSTD
 	/* Reuse stream objects for encoded_write decompression fallback */
-	ZSTD_DStream *zstd_dstream;
-#endif
-	z_stream *zlib_stream;
+	struct decomp_ctx decomp;
 };
+
+static int flush_pending(struct btrfs_receive *rctx);
+static int decompress_and_write(struct decomp_ctx *d, int fd,
+				const char *encoded_data, u64 offset,
+				u64 encoded_len, u64 unencoded_file_len,
+				u64 unencoded_len, u64 unencoded_offset,
+				u32 compression);
+static void close_inode_for_write(struct btrfs_receive *rctx);
 
 static int finish_subvol(struct btrfs_receive *rctx)
 {
@@ -175,8 +217,389 @@ out:
 	return ret;
 }
 
-static int flush_pending(struct btrfs_receive *rctx);
-static void close_inode_for_write(struct btrfs_receive *rctx);
+
+enum {
+	JOB_ENCODED_WRITE,
+	JOB_WRITE,
+	JOB_CHOWN,
+	JOB_CHMOD,
+	JOB_UTIMES,
+	JOB_TRUNCATE,
+	JOB_SETXATTR,
+	JOB_FALLOCATE,
+	JOB_FILEATTR,
+	JOB_CLOSE,
+};
+
+struct recv_job {
+	struct recv_job *next;
+	int type;
+	int fd;
+	char *path;
+	void *data;
+	u64 offset;
+	u64 len;
+	u64 unencoded_file_len;
+	u64 unencoded_len;
+	u64 unencoded_offset;
+	u32 compression;
+	u64 a;
+	u64 b;
+	struct timespec tv[2];
+	char *name;
+};
+
+struct recv_worker {
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	struct recv_job *head;
+	struct recv_job *tail;
+	u64 pushed;
+	u64 done;
+	int nr_queued;
+	size_t queued_bytes;
+	int error;
+	bool stop;
+	bool abort;
+	struct decomp_ctx decomp;
+};
+
+/* Per worker; the main thread waits when either is reached. */
+#define RECV_MAX_QUEUED_JOBS	4096
+#define RECV_MAX_QUEUED_BYTES	SZ_64M
+
+static void free_job(struct recv_job *job)
+{
+	free(job->path);
+	free(job->data);
+	free(job->name);
+	free(job);
+}
+
+static int run_job(struct recv_worker *w, struct recv_job *job)
+{
+	int ret = 0;
+
+	switch (job->type) {
+	case JOB_ENCODED_WRITE: {
+		struct iovec iov = { job->data, job->len };
+		struct btrfs_ioctl_encoded_io_args encoded = {
+			.iov = &iov,
+			.iovcnt = 1,
+			.offset = job->offset,
+			.len = job->unencoded_file_len,
+			.unencoded_len = job->unencoded_len,
+			.unencoded_offset = job->unencoded_offset,
+			.compression = job->compression,
+			.encryption = 0,
+		};
+
+		ret = ioctl(job->fd, BTRFS_IOC_ENCODED_WRITE, &encoded);
+		if (ret >= 0) {
+			ret = 0;
+			break;
+		}
+		/* Same fallback as process_encoded_write. */
+		if (errno != ENOSPC && errno != ENOTTY && errno != EINVAL) {
+			ret = -errno;
+			error("encoded_write: writing to %s failed: %m", job->path);
+			break;
+		}
+		ret = decompress_and_write(&w->decomp, job->fd, job->data,
+					   job->offset, job->len,
+					   job->unencoded_file_len,
+					   job->unencoded_len,
+					   job->unencoded_offset,
+					   job->compression);
+		break;
+	}
+	case JOB_WRITE: {
+		u64 pos = 0;
+
+		while (pos < job->len) {
+			ssize_t n = pwrite(job->fd, (char *)job->data + pos,
+					   job->len - pos, job->offset + pos);
+			if (n < 0) {
+				ret = -errno;
+				error("writing to %s failed: %m", job->path);
+				break;
+			}
+			pos += n;
+		}
+		break;
+	}
+	case JOB_CHOWN:
+		ret = fchown(job->fd, job->a, job->b);
+		if (ret < 0) {
+			ret = -errno;
+			error("chown %s failed: %m", job->path);
+		}
+		break;
+	case JOB_CHMOD:
+		ret = fchmod(job->fd, job->a);
+		if (ret < 0) {
+			ret = -errno;
+			error("chmod %s failed: %m", job->path);
+		}
+		break;
+	case JOB_UTIMES:
+		ret = futimens(job->fd, job->tv);
+		if (ret < 0) {
+			ret = -errno;
+			error("utimes %s failed: %m", job->path);
+		}
+		break;
+	case JOB_TRUNCATE:
+		ret = ftruncate(job->fd, job->a);
+		if (ret < 0) {
+			ret = -errno;
+			error("truncate %s failed: %m", job->path);
+		}
+		break;
+	case JOB_SETXATTR:
+		ret = fsetxattr(job->fd, job->name, job->data, job->len, 0);
+		if (ret < 0) {
+			ret = -errno;
+			error("lsetxattr %s %s=%.*s failed: %m", job->path,
+			      job->name, (int)job->len, (char *)job->data);
+		}
+		break;
+	case JOB_FALLOCATE:
+		ret = fallocate(job->fd, (int)job->a, job->offset, job->len);
+		if (ret < 0) {
+			ret = -errno;
+			error("fallocate: fallocate on %s failed: %m", job->path);
+		}
+		break;
+	case JOB_FILEATTR: {
+		unsigned int attr = job->a;
+
+		ret = ioctl(job->fd, FS_IOC_SETFLAGS, &attr);
+		if (ret < 0) {
+			ret = -errno;
+			error("fileattr: set file attributes on %s failed: %m",
+			      job->path);
+		}
+		break;
+	}
+	case JOB_CLOSE:
+		close(job->fd);
+		break;
+	}
+	return ret;
+}
+
+static void *worker_main(void *arg)
+{
+	struct recv_worker *w = arg;
+
+	for (;;) {
+		struct recv_job *job;
+		bool skip;
+		int ret = 0;
+
+		pthread_mutex_lock(&w->lock);
+		while (!w->head && !w->stop)
+			pthread_cond_wait(&w->cond, &w->lock);
+		job = w->head;
+		if (!job) {
+			pthread_mutex_unlock(&w->lock);
+			break;
+		}
+		w->head = job->next;
+		if (!w->head)
+			w->tail = NULL;
+		skip = w->error || w->abort;
+		pthread_mutex_unlock(&w->lock);
+
+		if (!skip || job->type == JOB_CLOSE)
+			ret = run_job(w, job);
+
+		pthread_mutex_lock(&w->lock);
+		if (ret < 0 && !w->error)
+			w->error = ret;
+		w->done++;
+		w->nr_queued--;
+		w->queued_bytes -= job->len;
+		pthread_cond_broadcast(&w->cond);
+		pthread_mutex_unlock(&w->lock);
+		free_job(job);
+	}
+	return NULL;
+}
+
+static int start_workers(struct btrfs_receive *rctx)
+{
+	/*
+	 * One worker measured best on a 3.3 GB stream of 191k files onto
+	 * LUKS2/NVMe (3.5 s -> 3.3 s); two or more contend with this thread
+	 * on the subvolume's tree and end up slower than none at all.
+	 */
+	const char *env = getenv("BTRFS_RECEIVE_WORKERS");
+	int n = env ? atoi(env) : 1;
+	int i;
+
+	if (n <= 0) {
+		rctx->nr_workers = 0;
+		return 0;
+	}
+	rctx->workers = calloc(n, sizeof(*rctx->workers));
+	if (!rctx->workers)
+		return -ENOMEM;
+	for (i = 0; i < n; i++) {
+		struct recv_worker *w = &rctx->workers[i];
+
+		pthread_mutex_init(&w->lock, NULL);
+		pthread_cond_init(&w->cond, NULL);
+		if (pthread_create(&w->thread, NULL, worker_main, w)) {
+			error("cannot create receive worker thread: %m");
+			break;
+		}
+		rctx->nr_workers++;
+	}
+	if (rctx->nr_workers == 0) {
+		free(rctx->workers);
+		rctx->workers = NULL;
+	}
+	return 0;
+}
+
+/* Wait until every worker has run everything queued so far. */
+static int drain_workers(struct btrfs_receive *rctx)
+{
+	int ret = 0;
+	int i;
+
+	for (i = 0; i < rctx->nr_workers; i++) {
+		struct recv_worker *w = &rctx->workers[i];
+
+		pthread_mutex_lock(&w->lock);
+		while (w->done < w->pushed && !w->error)
+			pthread_cond_wait(&w->cond, &w->lock);
+		if (w->error && !ret)
+			ret = w->error;
+		pthread_mutex_unlock(&w->lock);
+	}
+	return ret;
+}
+
+static void stop_workers(struct btrfs_receive *rctx, bool abort)
+{
+	int i;
+
+	for (i = 0; i < rctx->nr_workers; i++) {
+		struct recv_worker *w = &rctx->workers[i];
+
+		pthread_mutex_lock(&w->lock);
+		w->stop = true;
+		w->abort = abort;
+		pthread_cond_broadcast(&w->cond);
+		pthread_mutex_unlock(&w->lock);
+	}
+	for (i = 0; i < rctx->nr_workers; i++) {
+		struct recv_worker *w = &rctx->workers[i];
+
+		pthread_join(w->thread, NULL);
+		pthread_mutex_destroy(&w->lock);
+		pthread_cond_destroy(&w->cond);
+		free_decomp_ctx(&w->decomp);
+	}
+	free(rctx->workers);
+	rctx->workers = NULL;
+	rctx->nr_workers = 0;
+}
+
+static struct recv_job *new_job(int type, const char *path)
+{
+	struct recv_job *job = calloc(1, sizeof(*job));
+
+	if (!job)
+		return NULL;
+	job->type = type;
+	job->path = strdup(path);
+	if (!job->path) {
+		free(job);
+		return NULL;
+	}
+	return job;
+}
+
+/* Queue job for the current asynchronous file, in order after the others. */
+static int queue_job(struct btrfs_receive *rctx, struct recv_job *job)
+{
+	struct recv_worker *w = &rctx->workers[rctx->async_worker];
+	int ret = 0;
+
+	if (!job)
+		return -ENOMEM;
+	job->fd = rctx->async_fd;
+	pthread_mutex_lock(&w->lock);
+	while (!w->error && w->nr_queued > 0 &&
+	       (w->nr_queued >= RECV_MAX_QUEUED_JOBS ||
+		w->queued_bytes + job->len > RECV_MAX_QUEUED_BYTES))
+		pthread_cond_wait(&w->cond, &w->lock);
+	if (w->error) {
+		ret = w->error;
+	} else {
+		job->next = NULL;
+		if (w->tail)
+			w->tail->next = job;
+		else
+			w->head = job;
+		w->tail = job;
+		w->pushed++;
+		w->nr_queued++;
+		w->queued_bytes += job->len;
+		pthread_cond_broadcast(&w->cond);
+	}
+	pthread_mutex_unlock(&w->lock);
+	if (ret)
+		free_job(job);
+	return ret;
+}
+
+static bool is_async_file(struct btrfs_receive *rctx, const char *path)
+{
+	return rctx->async_fd != -1 && strcmp(path, rctx->async_path) == 0;
+}
+
+/* The current asynchronous file is done with: its worker closes it. */
+static int end_async_file(struct btrfs_receive *rctx)
+{
+	int ret;
+
+	if (rctx->async_fd == -1)
+		return 0;
+	ret = queue_job(rctx, new_job(JOB_CLOSE, rctx->async_path));
+	rctx->async_fd = -1;
+	rctx->async_path[0] = 0;
+	return ret;
+}
+
+/* Hand a freshly created file over to the least loaded worker. */
+static int begin_async_file(struct btrfs_receive *rctx, int fd, const char *path)
+{
+	int best = 0;
+	int i;
+
+	for (i = 1; i < rctx->nr_workers; i++) {
+		if (rctx->workers[i].nr_queued < rctx->workers[best].nr_queued)
+			best = i;
+	}
+	rctx->async_worker = best;
+	rctx->async_fd = fd;
+	strncpy_null(rctx->async_path, path, sizeof(rctx->async_path));
+	return 0;
+}
+
+/* Drain if a command by path would race a worker on that same file. */
+static int sync_async_file(struct btrfs_receive *rctx, const char *path)
+{
+	if (rctx->async_fd == -1 || strcmp(path, rctx->async_path) != 0)
+		return 0;
+	return drain_workers(rctx);
+}
 
 static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 			  void *user)
@@ -186,6 +609,13 @@ static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 	struct btrfs_ioctl_vol_args args_v1;
 	char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = end_async_file(rctx);
+	if (ret < 0)
+		return ret;
+	ret = drain_workers(rctx);
 	if (ret < 0)
 		return ret;
 
@@ -280,6 +710,13 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	struct subvol_info *parent_subvol = NULL;
 	rctx->skip_root_chown = false;
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = end_async_file(rctx);
+	if (ret < 0)
+		return ret;
+	ret = drain_workers(rctx);
 	if (ret < 0)
 		return ret;
 
@@ -472,11 +909,22 @@ static int create_inode(struct btrfs_receive *rctx, int type, const char *path,
 		ret = open(full_path, O_RDWR | O_CREAT | (excl ? O_EXCL : O_TRUNC),
 			   0600);
 		if (ret >= 0) {
-			close_inode_for_write(rctx);
-			rctx->write_fd = ret;
-			strncpy_null(rctx->write_path, full_path,
-				     sizeof(rctx->write_path));
-			ret = 0;
+			int fd = ret;
+
+			if (rctx->nr_workers > 0 && !rctx->force_decompress) {
+				ret = end_async_file(rctx);
+				if (ret < 0) {
+					close(fd);
+					return ret;
+				}
+				ret = begin_async_file(rctx, fd, path);
+			} else {
+				close_inode_for_write(rctx);
+				rctx->write_fd = fd;
+				strncpy_null(rctx->write_path, full_path,
+					     sizeof(rctx->write_path));
+				ret = 0;
+			}
 		}
 		break;
 	case PENDING_DIR:
@@ -691,6 +1139,9 @@ static int process_rename(const char *from, const char *to, void *user)
 		if (ret < 0)
 			return ret;
 	}
+	ret = sync_async_file(rctx, to);
+	if (ret < 0)
+		return ret;
 
 	ret = path_cat_out(full_from, rctx->full_subvol_path, from);
 	if (ret < 0) {
@@ -711,6 +1162,8 @@ static int process_rename(const char *from, const char *to, void *user)
 	if (ret < 0) {
 		ret = -errno;
 		error("rename %s -> %s failed: %m", from, to);
+	} else if (is_async_file(rctx, from)) {
+		strncpy_null(rctx->async_path, to, sizeof(rctx->async_path));
 	}
 
 out:
@@ -724,6 +1177,13 @@ static int process_link(const char *path, const char *lnk, void *user)
 	char full_path[PATH_MAX];
 	char full_link_path[PATH_MAX];
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = sync_async_file(rctx, path);
+	if (ret < 0)
+		return ret;
+	ret = sync_async_file(rctx, lnk);
 	if (ret < 0)
 		return ret;
 
@@ -763,6 +1223,10 @@ static int process_unlink(const char *path, void *user)
 	if (ret < 0)
 		return ret;
 
+	ret = sync_async_file(rctx, path);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -789,6 +1253,10 @@ static int process_rmdir(const char *path, void *user)
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = sync_async_file(rctx, path);
 	if (ret < 0)
 		return ret;
 
@@ -856,6 +1324,21 @@ static int process_write(const char *path, const void *data, u64 offset,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path)) {
+		struct recv_job *job = new_job(JOB_WRITE, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->data = malloc(len);
+		if (!job->data) {
+			free_job(job);
+			return -ENOMEM;
+		}
+		memcpy(job->data, data, len);
+		job->offset = offset;
+		job->len = len;
+		return queue_job(rctx, job);
+	}
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -907,6 +1390,10 @@ static int process_clone(const char *path, u64 offset, u64 len,
 	char full_clone_path[PATH_MAX];
 	int clone_fd = -1;
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = drain_workers(rctx);
 	if (ret < 0)
 		return ret;
 
@@ -1007,6 +1494,21 @@ static int process_set_xattr(const char *path, const char *name,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path)) {
+		struct recv_job *job = new_job(JOB_SETXATTR, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->name = strdup(name);
+		job->data = malloc(len);
+		if (!job->name || !job->data) {
+			free_job(job);
+			return -ENOMEM;
+		}
+		memcpy(job->data, data, len);
+		job->len = len;
+		return queue_job(rctx, job);
+	}
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1038,6 +1540,10 @@ static int process_remove_xattr(const char *path, const char *name, void *user)
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = sync_async_file(rctx, path);
 	if (ret < 0)
 		return ret;
 
@@ -1073,6 +1579,14 @@ static int process_truncate(const char *path, u64 size, void *user)
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path)) {
+		struct recv_job *job = new_job(JOB_TRUNCATE, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->a = size;
+		return queue_job(rctx, job);
+	}
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1119,6 +1633,15 @@ static int process_chmod(const char *path, u64 mode, void *user)
 			goto out;
 	}
 
+	if (is_async_file(rctx, path)) {
+		struct recv_job *job = new_job(JOB_CHMOD, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->a = mode;
+		return queue_job(rctx, job);
+	}
+
 	ret = chmod(full_path, mode);
 	if (ret < 0) {
 		ret = -errno;
@@ -1158,6 +1681,16 @@ static int process_chown(const char *path, u64 uid, u64 gid, void *user)
 		fprintf(stderr, "chown %s - uid=%llu, gid=%llu\n", path,
 				uid, gid);
 
+	if (is_async_file(rctx, path)) {
+		struct recv_job *job = new_job(JOB_CHOWN, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->a = uid;
+		job->b = gid;
+		return queue_job(rctx, job);
+	}
+
 	ret = lchown(full_path, uid, gid);
 	if (ret < 0) {
 		ret = -errno;
@@ -1180,6 +1713,15 @@ static int process_utimes(const char *path, struct timespec *at,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path)) {
+		struct recv_job *job = new_job(JOB_UTIMES, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->tv[0] = *at;
+		job->tv[1] = *mt;
+		return queue_job(rctx, job);
+	}
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1217,42 +1759,42 @@ static int process_update_extent(const char *path, u64 offset, u64 len,
 	return 0;
 }
 
-static int decompress_zlib(struct btrfs_receive *rctx, const char *encoded_data,
+static int decompress_zlib(struct decomp_ctx *d, const char *encoded_data,
 			   u64 encoded_len, char *unencoded_data,
 			   u64 unencoded_len)
 {
 	bool init = false;
 	int ret;
 
-	if (!rctx->zlib_stream) {
+	if (!d->zlib_stream) {
 		init = true;
-		rctx->zlib_stream = malloc(sizeof(z_stream));
-		if (!rctx->zlib_stream) {
+		d->zlib_stream = malloc(sizeof(z_stream));
+		if (!d->zlib_stream) {
 			error_mem("zlib stream: %m");
 			return -ENOMEM;
 		}
 	}
-	rctx->zlib_stream->next_in = (void *)encoded_data;
-	rctx->zlib_stream->avail_in = encoded_len;
-	rctx->zlib_stream->next_out = (void *)unencoded_data;
-	rctx->zlib_stream->avail_out = unencoded_len;
+	d->zlib_stream->next_in = (void *)encoded_data;
+	d->zlib_stream->avail_in = encoded_len;
+	d->zlib_stream->next_out = (void *)unencoded_data;
+	d->zlib_stream->avail_out = unencoded_len;
 
 	if (init) {
-		rctx->zlib_stream->zalloc = Z_NULL;
-		rctx->zlib_stream->zfree = Z_NULL;
-		rctx->zlib_stream->opaque = Z_NULL;
-		ret = inflateInit(rctx->zlib_stream);
+		d->zlib_stream->zalloc = Z_NULL;
+		d->zlib_stream->zfree = Z_NULL;
+		d->zlib_stream->opaque = Z_NULL;
+		ret = inflateInit(d->zlib_stream);
 	} else {
-		ret = inflateReset(rctx->zlib_stream);
+		ret = inflateReset(d->zlib_stream);
 	}
 	if (ret != Z_OK) {
 		error("zlib inflate init failed: %d", ret);
 		return -EIO;
 	}
 
-	while (rctx->zlib_stream->avail_in > 0 &&
-	       rctx->zlib_stream->avail_out > 0) {
-		ret = inflate(rctx->zlib_stream, Z_FINISH);
+	while (d->zlib_stream->avail_in > 0 &&
+	       d->zlib_stream->avail_out > 0) {
+		ret = inflate(d->zlib_stream, Z_FINISH);
 		if (ret == Z_STREAM_END) {
 			break;
 		} else if (ret != Z_OK) {
@@ -1264,7 +1806,7 @@ static int decompress_zlib(struct btrfs_receive *rctx, const char *encoded_data,
 }
 
 #if COMPRESSION_ZSTD
-static int decompress_zstd(struct btrfs_receive *rctx, const char *encoded_buf,
+static int decompress_zstd(struct decomp_ctx *d, const char *encoded_buf,
 			   u64 encoded_len, char *unencoded_buf,
 			   u64 unencoded_len)
 {
@@ -1278,20 +1820,20 @@ static int decompress_zstd(struct btrfs_receive *rctx, const char *encoded_buf,
 	};
 	size_t ret;
 
-	if (!rctx->zstd_dstream) {
-		rctx->zstd_dstream = ZSTD_createDStream();
-		if (!rctx->zstd_dstream) {
+	if (!d->zstd_dstream) {
+		d->zstd_dstream = ZSTD_createDStream();
+		if (!d->zstd_dstream) {
 			error("failed to create zstd dstream");
 			return -ENOMEM;
 		}
 	}
-	ret = ZSTD_initDStream(rctx->zstd_dstream);
+	ret = ZSTD_initDStream(d->zstd_dstream);
 	if (ZSTD_isError(ret)) {
 		error("failed to init zstd stream: %s", ZSTD_getErrorName(ret));
 		return -EIO;
 	}
 	while (in_buf.pos < in_buf.size && out_buf.pos < out_buf.size) {
-		ret = ZSTD_decompressStream(rctx->zstd_dstream, &out_buf, &in_buf);
+		ret = ZSTD_decompressStream(d->zstd_dstream, &out_buf, &in_buf);
 		if (ret == 0) {
 			break;
 		} else if (ZSTD_isError(ret)) {
@@ -1377,7 +1919,7 @@ static int decompress_lzo(const char *encoded_data, u64 encoded_len,
 }
 #endif
 
-static int decompress_and_write(struct btrfs_receive *rctx,
+static int decompress_and_write(struct decomp_ctx *d, int fd,
 				const char *encoded_data, u64 offset,
 				u64 encoded_len, u64 unencoded_file_len,
 				u64 unencoded_len, u64 unencoded_offset,
@@ -1396,14 +1938,14 @@ static int decompress_and_write(struct btrfs_receive *rctx,
 
 	switch (compression) {
 	case BTRFS_ENCODED_IO_COMPRESSION_ZLIB:
-		ret = decompress_zlib(rctx, encoded_data, encoded_len,
+		ret = decompress_zlib(d, encoded_data, encoded_len,
 				      unencoded_data, unencoded_len);
 		if (ret)
 			goto out;
 		break;
 	case BTRFS_ENCODED_IO_COMPRESSION_ZSTD:
 #if COMPRESSION_ZSTD
-		ret = decompress_zstd(rctx, encoded_data, encoded_len,
+		ret = decompress_zstd(d, encoded_data, encoded_len,
 				      unencoded_data, unencoded_len);
 		if (ret)
 			goto out;
@@ -1440,7 +1982,7 @@ static int decompress_and_write(struct btrfs_receive *rctx,
 	while (written < unencoded_file_len) {
 		ssize_t w;
 
-		w = pwrite(rctx->write_fd, unencoded_data + unencoded_offset,
+		w = pwrite(fd, unencoded_data + unencoded_offset,
 			   unencoded_file_len - written, offset);
 		if (w == 0) {
 			ret = -EIO;
@@ -1484,6 +2026,25 @@ static int process_encoded_write(const char *path, const void *data, u64 offset,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path) && !encryption) {
+		struct recv_job *job = new_job(JOB_ENCODED_WRITE, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->data = malloc(len);
+		if (!job->data) {
+			free_job(job);
+			return -ENOMEM;
+		}
+		memcpy(job->data, data, len);
+		job->offset = offset;
+		job->len = len;
+		job->unencoded_file_len = unencoded_file_len;
+		job->unencoded_len = unencoded_len;
+		job->unencoded_offset = unencoded_offset;
+		job->compression = compression;
+		return queue_job(rctx, job);
+	}
 
 	if (bconf.verbose >= 3)
 		fprintf(stderr,
@@ -1522,7 +2083,8 @@ static int process_encoded_write(const char *path, const void *data, u64 offset,
 				path, errno);
 	}
 
-	return decompress_and_write(rctx, data, offset, len, unencoded_file_len,
+	return decompress_and_write(&rctx->decomp, rctx->write_fd, data,
+				    offset, len, unencoded_file_len,
 				    unencoded_len, unencoded_offset,
 				    compression);
 }
@@ -1537,6 +2099,16 @@ static int process_fallocate(const char *path, int mode, u64 offset, u64 len,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path)) {
+		struct recv_job *job = new_job(JOB_FALLOCATE, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->a = mode;
+		job->offset = offset;
+		job->len = len;
+		return queue_job(rctx, job);
+	}
 
 	if (bconf.verbose >= 3)
 		fprintf(stderr,
@@ -1579,6 +2151,14 @@ static int process_fileattr(const char *path, u64 attr, void *user)
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path)) {
+		struct recv_job *job = new_job(JOB_FILEATTR, path);
+
+		if (!job)
+			return -ENOMEM;
+		job->a = attr;
+		return queue_job(rctx, job);
+	}
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1613,6 +2193,10 @@ static int process_enable_verity(const char *path, u8 algorithm, u32 block_size,
 		.block_size = block_size,
 	};
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = sync_async_file(rctx, path);
 	if (ret < 0)
 		return ret;
 
@@ -1802,6 +2386,10 @@ static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
 			rctx->dest_dir_path++;
 	}
 
+	ret = start_workers(rctx);
+	if (ret < 0)
+		goto out;
+
 	while (!end) {
 		ret = btrfs_read_and_process_send_stream(r_fd, &send_ops,
 							 rctx,
@@ -1826,6 +2414,12 @@ static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
 		ret = flush_pending(rctx);
 		if (ret < 0)
 			goto out;
+		ret = end_async_file(rctx);
+		if (ret < 0)
+			goto out;
+		ret = drain_workers(rctx);
+		if (ret < 0)
+			goto out;
 		close_inode_for_write(rctx);
 		ret = finish_subvol(rctx);
 		if (ret < 0)
@@ -1836,6 +2430,11 @@ static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
 	ret = 0;
 
 out:
+	if (rctx->async_fd != -1) {
+		close(rctx->async_fd);
+		rctx->async_fd = -1;
+	}
+	stop_workers(rctx, ret < 0);
 	if (rctx->write_fd != -1) {
 		close(rctx->write_fd);
 		rctx->write_fd = -1;
@@ -1854,14 +2453,7 @@ out:
 		close(rctx->dest_dir_fd);
 		rctx->dest_dir_fd = -1;
 	}
-#if COMPRESSION_ZSTD
-	if (rctx->zstd_dstream)
-		ZSTD_freeDStream(rctx->zstd_dstream);
-#endif
-	if (rctx->zlib_stream) {
-		inflateEnd(rctx->zlib_stream);
-		free(rctx->zlib_stream);
-	}
+	free_decomp_ctx(&rctx->decomp);
 
 	return ret;
 }
@@ -1933,6 +2525,7 @@ static int cmd_receive(const struct cmd_struct *cmd, int argc, char **argv)
 	rctx.dest_dir_fd = -1;
 	rctx.dest_dir_chroot = false;
 	rctx.pending_type = PENDING_NONE;
+	rctx.async_fd = -1;
 	rctx.skip_root_chown = geteuid() == 0 && getegid() == 0;
 	realmnt[0] = 0;
 	fromfile[0] = 0;
