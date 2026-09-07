@@ -78,6 +78,17 @@ struct btrfs_receive
 
 	bool dest_dir_chroot;
 
+	/*
+	 * A create command (mkfile, mkdir, symlink) is held back until the
+	 * next command arrives. Send names every new inode o<ino>-<gen>-<idx>
+	 * and renames it to its real name in the very next command, so
+	 * creating it under the real name right away saves the rename, which
+	 * costs as much as the creation itself. See defer_create().
+	 */
+	int pending_type;
+	char pending_path[PATH_MAX];
+	char pending_link[PATH_MAX];
+
 	bool honor_end_cmd;
 
 	bool force_decompress;
@@ -153,6 +164,8 @@ out:
 	return ret;
 }
 
+static int flush_pending(struct btrfs_receive *rctx);
+
 static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 			  void *user)
 {
@@ -160,6 +173,10 @@ static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 	struct btrfs_receive *rctx = user;
 	struct btrfs_ioctl_vol_args args_v1;
 	char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = finish_subvol(rctx);
 	if (ret < 0)
@@ -249,6 +266,10 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
 	struct btrfs_ioctl_vol_args_v2 args_v2;
 	struct subvol_info *parent_subvol = NULL;
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = finish_subvol(rctx);
 	if (ret < 0)
@@ -390,57 +411,118 @@ out:
 	return ret;
 }
 
-static int process_mkfile(const char *path, void *user)
+enum {
+	PENDING_NONE,
+	PENDING_FILE,
+	PENDING_DIR,
+	PENDING_SYMLINK,
+};
+
+static const char *pending_name(int type)
+{
+	switch (type) {
+	case PENDING_FILE: return "mkfile";
+	case PENDING_DIR: return "mkdir";
+	default: return "symlink";
+	}
+}
+
+/*
+ * Create the inode at path. With excl set, an existing path is reported as
+ * -EEXIST without a message, for the caller to fall back on.
+ */
+static int create_inode(struct btrfs_receive *rctx, int type, const char *path,
+			const char *lnk, bool excl)
 {
 	int ret;
-	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
-		error("mkfile: path invalid: %s", path);
-		goto out;
+		error("%s: path invalid: %s", pending_name(type), path);
+		return ret;
 	}
 
-	if (bconf.verbose >= 3)
-		fprintf(stderr, "mkfile %s\n", path);
+	if (bconf.verbose >= 3) {
+		if (type == PENDING_SYMLINK)
+			fprintf(stderr, "symlink %s -> %s\n", path, lnk);
+		else
+			fprintf(stderr, "%s %s\n", pending_name(type), path);
+	}
 
-	ret = creat(full_path, 0600);
+	switch (type) {
+	case PENDING_FILE:
+		ret = open(full_path, O_WRONLY | O_CREAT | (excl ? O_EXCL : O_TRUNC),
+			   0600);
+		if (ret >= 0) {
+			close(ret);
+			ret = 0;
+		}
+		break;
+	case PENDING_DIR:
+		ret = mkdir(full_path, 0700);
+		break;
+	default:
+		ret = symlink(lnk, full_path);
+		break;
+	}
 	if (ret < 0) {
 		ret = -errno;
-		error("mkfile %s failed: %m", path);
-		goto out;
+		if (excl && ret == -EEXIST)
+			return ret;
+		if (type == PENDING_SYMLINK)
+			error("symlink %s -> %s failed: %m", path, lnk);
+		else
+			error("%s %s failed: %m", pending_name(type), path);
 	}
-	close(ret);
-	ret = 0;
-
-out:
 	return ret;
+}
+
+/* Create the held-back inode under the name the stream gave it. */
+static int flush_pending(struct btrfs_receive *rctx)
+{
+	int type = rctx->pending_type;
+
+	if (type == PENDING_NONE)
+		return 0;
+	rctx->pending_type = PENDING_NONE;
+	return create_inode(rctx, type, rctx->pending_path, rctx->pending_link,
+			    false);
+}
+
+static int defer_create(struct btrfs_receive *rctx, int type, const char *path,
+			const char *lnk)
+{
+	int ret;
+
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+	if (strlen(path) >= sizeof(rctx->pending_path) ||
+	    (lnk && strlen(lnk) >= sizeof(rctx->pending_link)))
+		return create_inode(rctx, type, path, lnk, false);
+	rctx->pending_type = type;
+	strncpy_null(rctx->pending_path, path, sizeof(rctx->pending_path));
+	if (lnk)
+		strncpy_null(rctx->pending_link, lnk, sizeof(rctx->pending_link));
+	else
+		rctx->pending_link[0] = 0;
+	return 0;
+}
+
+static int process_mkfile(const char *path, void *user)
+{
+	return defer_create(user, PENDING_FILE, path, NULL);
 }
 
 static int process_mkdir(const char *path, void *user)
 {
-	int ret;
-	struct btrfs_receive *rctx = user;
-	char full_path[PATH_MAX];
+	return defer_create(user, PENDING_DIR, path, NULL);
+}
 
-	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
-	if (ret < 0) {
-		error("mkdir: path invalid: %s", path);
-		goto out;
-	}
-
-	if (bconf.verbose >= 3)
-		fprintf(stderr, "mkdir %s\n", path);
-
-	ret = mkdir(full_path, 0700);
-	if (ret < 0) {
-		ret = -errno;
-		error("mkdir %s failed: %m", path);
-	}
-
-out:
-	return ret;
+static int process_symlink(const char *path, const char *lnk, void *user)
+{
+	return defer_create(user, PENDING_SYMLINK, path, lnk);
 }
 
 static int process_mknod(const char *path, u64 mode, u64 dev, void *user)
@@ -448,6 +530,10 @@ static int process_mknod(const char *path, u64 mode, u64 dev, void *user)
 	int ret;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -474,6 +560,10 @@ static int process_mkfifo(const char *path, void *user)
 	int ret;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -499,6 +589,10 @@ static int process_mksock(const char *path, void *user)
 	int ret;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -519,37 +613,33 @@ out:
 	return ret;
 }
 
-static int process_symlink(const char *path, const char *lnk, void *user)
-{
-	int ret;
-	struct btrfs_receive *rctx = user;
-	char full_path[PATH_MAX];
-
-	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
-	if (ret < 0) {
-		error("symlink: path invalid: %s", path);
-		goto out;
-	}
-
-	if (bconf.verbose >= 3)
-		fprintf(stderr, "symlink %s -> %s\n", path, lnk);
-
-	ret = symlink(lnk, full_path);
-	if (ret < 0) {
-		ret = -errno;
-		error("symlink %s -> %s failed: %m", path, lnk);
-	}
-
-out:
-	return ret;
-}
-
 static int process_rename(const char *from, const char *to, void *user)
 {
 	int ret;
 	struct btrfs_receive *rctx = user;
 	char full_from[PATH_MAX];
 	char full_to[PATH_MAX];
+
+	if (rctx->pending_type != PENDING_NONE &&
+	    strcmp(from, rctx->pending_path) == 0) {
+		int type = rctx->pending_type;
+
+		rctx->pending_type = PENDING_NONE;
+		ret = create_inode(rctx, type, to, rctx->pending_link, true);
+		if (ret != -EEXIST)
+			return ret;
+		/*
+		 * Something is already at the destination: take the stream's
+		 * own route, create the orphan and rename it over the top.
+		 */
+		ret = create_inode(rctx, type, from, rctx->pending_link, false);
+		if (ret < 0)
+			return ret;
+	} else {
+		ret = flush_pending(rctx);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = path_cat_out(full_from, rctx->full_subvol_path, from);
 	if (ret < 0) {
@@ -582,6 +672,10 @@ static int process_link(const char *path, const char *lnk, void *user)
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
 	char full_link_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -614,6 +708,10 @@ static int process_unlink(const char *path, void *user)
 	int ret;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -639,6 +737,10 @@ static int process_rmdir(const char *path, void *user)
 	int ret;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -699,6 +801,10 @@ static int process_write(const char *path, const void *data, u64 offset,
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
 	u64 pos = 0;
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -749,6 +855,10 @@ static int process_clone(const char *path, u64 offset, u64 len,
 	const char *subvol_path;
 	char full_clone_path[PATH_MAX];
 	int clone_fd = -1;
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -842,6 +952,10 @@ static int process_set_xattr(const char *path, const char *name,
 	int ret = 0;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -872,6 +986,10 @@ static int process_remove_xattr(const char *path, const char *name, void *user)
 	int ret = 0;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -900,6 +1018,10 @@ static int process_truncate(const char *path, u64 size, void *user)
 	int ret = 0;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -926,6 +1048,10 @@ static int process_chmod(const char *path, u64 mode, void *user)
 	int ret = 0;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -952,6 +1078,10 @@ static int process_chown(const char *path, u64 uid, u64 gid, void *user)
 	int ret = 0;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -981,6 +1111,10 @@ static int process_utimes(const char *path, struct timespec *at,
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
 	struct timespec tv[2];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1281,6 +1415,10 @@ static int process_encoded_write(const char *path, const void *data, u64 offset,
 		.compression = compression,
 		.encryption = encryption,
 	};
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	if (bconf.verbose >= 3)
 		fprintf(stderr,
@@ -1330,6 +1468,10 @@ static int process_fallocate(const char *path, int mode, u64 offset, u64 len,
 	int ret;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	if (bconf.verbose >= 3)
 		fprintf(stderr,
@@ -1368,6 +1510,10 @@ static int process_fileattr(const char *path, u64 attr, void *user)
 	int ret;
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1401,6 +1547,10 @@ static int process_enable_verity(const char *path, u8 algorithm, u32 block_size,
 		.hash_algorithm = algorithm,
 		.block_size = block_size,
 	};
+	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
 
 	if (salt_len) {
 		verity_args.salt_size = salt_len;
@@ -1608,6 +1758,9 @@ static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
 		if (ret > 0)
 			end = true;
 
+		ret = flush_pending(rctx);
+		if (ret < 0)
+			goto out;
 		close_inode_for_write(rctx);
 		ret = finish_subvol(rctx);
 		if (ret < 0)
@@ -1714,6 +1867,7 @@ static int cmd_receive(const struct cmd_struct *cmd, int argc, char **argv)
 	rctx.write_fd = -1;
 	rctx.dest_dir_fd = -1;
 	rctx.dest_dir_chroot = false;
+	rctx.pending_type = PENDING_NONE;
 	realmnt[0] = 0;
 	fromfile[0] = 0;
 
