@@ -89,6 +89,17 @@ struct btrfs_receive
 	char pending_path[PATH_MAX];
 	char pending_link[PATH_MAX];
 
+	/*
+	 * Everything a full receive creates is owned by the receiving user
+	 * already, so chown to root:root by root is a no-op and skipped. Off
+	 * for incremental streams (they chown inodes the parent snapshot
+	 * owns differently), and for files below a directory that got a
+	 * setgid chmod (they inherit its group).
+	 */
+	bool skip_root_chown;
+	char **setgid_dirs;
+	int setgid_dirs_cnt;
+
 	bool honor_end_cmd;
 
 	bool force_decompress;
@@ -267,6 +278,7 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
 	struct btrfs_ioctl_vol_args_v2 args_v2;
 	struct subvol_info *parent_subvol = NULL;
+	rctx->skip_root_chown = false;
 	ret = flush_pending(rctx);
 	if (ret < 0)
 		return ret;
@@ -484,6 +496,37 @@ static int create_inode(struct btrfs_receive *rctx, int type, const char *path,
 			error("%s %s failed: %m", pending_name(type), path);
 	}
 	return ret;
+}
+
+static int remember_setgid_dir(struct btrfs_receive *rctx, const char *path)
+{
+	char **dirs;
+
+	dirs = realloc(rctx->setgid_dirs,
+		       (rctx->setgid_dirs_cnt + 1) * sizeof(*dirs));
+	if (!dirs)
+		return -ENOMEM;
+	rctx->setgid_dirs = dirs;
+	dirs[rctx->setgid_dirs_cnt] = strdup(path);
+	if (!dirs[rctx->setgid_dirs_cnt])
+		return -ENOMEM;
+	rctx->setgid_dirs_cnt++;
+	return 0;
+}
+
+/* Whether the directory holding path had a setgid chmod in this stream. */
+static bool parent_is_setgid(struct btrfs_receive *rctx, const char *path)
+{
+	const char *slash = strrchr(path, '/');
+	size_t dirlen = slash ? slash - path : 0;
+	int i;
+
+	for (i = 0; i < rctx->setgid_dirs_cnt; i++) {
+		if (strlen(rctx->setgid_dirs[i]) == dirlen &&
+		    strncmp(rctx->setgid_dirs[i], path, dirlen) == 0)
+			return true;
+	}
+	return false;
 }
 
 /* Create the held-back inode under the name the stream gave it. */
@@ -1070,6 +1113,12 @@ static int process_chmod(const char *path, u64 mode, void *user)
 	if (bconf.verbose >= 3)
 		fprintf(stderr, "chmod %s - mode=0%o\n", path, (int)mode);
 
+	if (mode & S_ISGID) {
+		ret = remember_setgid_dir(rctx, path);
+		if (ret < 0)
+			goto out;
+	}
+
 	ret = chmod(full_path, mode);
 	if (ret < 0) {
 		ret = -errno;
@@ -1094,6 +1143,14 @@ static int process_chown(const char *path, u64 uid, u64 gid, void *user)
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
 		error("chown: path invalid: %s", path);
+		goto out;
+	}
+
+	if (uid == 0 && gid == 0 && rctx->skip_root_chown &&
+	    !parent_is_setgid(rctx, path)) {
+		if (bconf.verbose >= 3)
+			fprintf(stderr, "chown %s - uid=0, gid=0 (already owned by root, skipped)\n",
+					path);
 		goto out;
 	}
 
@@ -1876,6 +1933,7 @@ static int cmd_receive(const struct cmd_struct *cmd, int argc, char **argv)
 	rctx.dest_dir_fd = -1;
 	rctx.dest_dir_chroot = false;
 	rctx.pending_type = PENDING_NONE;
+	rctx.skip_root_chown = geteuid() == 0 && getegid() == 0;
 	realmnt[0] = 0;
 	fromfile[0] = 0;
 
@@ -1994,6 +2052,9 @@ static int cmd_receive(const struct cmd_struct *cmd, int argc, char **argv)
 	if (receive_fd != fileno(stdin))
 		close(receive_fd);
 out:
+	while (rctx.setgid_dirs_cnt > 0)
+		free(rctx.setgid_dirs[--rctx.setgid_dirs_cnt]);
+	free(rctx.setgid_dirs);
 
 	return !!ret;
 }
