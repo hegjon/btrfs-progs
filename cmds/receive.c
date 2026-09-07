@@ -165,6 +165,7 @@ out:
 }
 
 static int flush_pending(struct btrfs_receive *rctx);
+static void close_inode_for_write(struct btrfs_receive *rctx);
 
 static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 			  void *user)
@@ -452,10 +453,17 @@ static int create_inode(struct btrfs_receive *rctx, int type, const char *path,
 
 	switch (type) {
 	case PENDING_FILE:
-		ret = open(full_path, O_WRONLY | O_CREAT | (excl ? O_EXCL : O_TRUNC),
+		/*
+		 * The data commands for this file come next; keep the
+		 * descriptor for them rather than opening the path again.
+		 */
+		ret = open(full_path, O_RDWR | O_CREAT | (excl ? O_EXCL : O_TRUNC),
 			   0600);
 		if (ret >= 0) {
-			close(ret);
+			close_inode_for_write(rctx);
+			rctx->write_fd = ret;
+			strncpy_null(rctx->write_path, full_path,
+				     sizeof(rctx->write_path));
 			ret = 0;
 		}
 		break;
