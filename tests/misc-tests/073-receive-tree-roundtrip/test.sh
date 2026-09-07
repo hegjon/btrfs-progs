@@ -128,9 +128,19 @@ run_check bash -c "head -c \$(( \$(stat -c %s '$here/full.stream') * 2 / 3 )) '$
 run_check $SUDO_HELPER mkdir "$recv-trunc"
 run_mustfail "truncated stream accepted" $SUDO_HELPER "$TOP/btrfs" receive -q -f "$here/trunc.stream" "$recv-trunc"
 
+# Worker thread on and off, where the receive has one; ignored otherwise
+for workers in 0 1; do
+	run_check $SUDO_HELPER mkdir "$recv-w$workers"
+	run_check $SUDO_HELPER env BTRFS_RECEIVE_WORKERS=$workers "$TOP/btrfs" receive -q -f "$here/full.stream" "$recv-w$workers"
+	verify snap1 "$recv-w$workers/snap1"
+	run_check $SUDO_HELPER env BTRFS_RECEIVE_WORKERS=$workers "$TOP/btrfs" receive -q -f "$here/incr.stream" "$recv-w$workers"
+	verify snap2 "$recv-w$workers/snap2"
+done
+
 run_check_umount_test_dev
 
-# A stream that does not fit: the receive must exit non-zero
+# A stream that does not fit: the receive must exit non-zero, with or
+# without a worker thread doing the writes
 run_check_mkfs_test_dev
 run_check_mount_test_dev
 run_check $SUDO_HELPER "$TOP/btrfs" subvolume create "$src"
@@ -141,9 +151,13 @@ run_check $SUDO_HELPER "$TOP/btrfs" send -q -f "$here/big.stream" "$TEST_MNT/sna
 run_check_umount_test_dev
 run_check_mkfs_test_dev -b 256M
 run_check_mount_test_dev
-run_check $SUDO_HELPER mkdir "$recv"
-run_mustfail "receive succeeded on a filesystem too small for the stream" \
-	$SUDO_HELPER "$TOP/btrfs" receive -q -f "$here/big.stream" "$recv"
+for workers in 0 1; do
+	run_check $SUDO_HELPER mkdir "$recv-w$workers"
+	run_mustfail "receive succeeded on a filesystem too small for the stream" \
+		$SUDO_HELPER env BTRFS_RECEIVE_WORKERS=$workers "$TOP/btrfs" receive -q -f "$here/big.stream" "$recv-w$workers"
+	run_check $SUDO_HELPER "$TOP/btrfs" subvolume delete "$recv-w$workers/snap"
+	run_check $SUDO_HELPER "$TOP/btrfs" subvolume sync "$TEST_MNT"
+done
 run_check_umount_test_dev
 
 rm -f -- "$here"/*.fssum "$here"/*.stream
