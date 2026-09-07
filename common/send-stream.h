@@ -24,6 +24,12 @@
 struct timespec;
 
 struct btrfs_send_ops {
+	/*
+	 * Called with the raw bytes of every command (header included, crc
+	 * intact) before its handler, so a receiver can forward the command
+	 * to another parser unchanged. Optional.
+	 */
+	int (*cmd_raw)(const void *buf, size_t len, u32 version, void *user);
 	int (*subvol)(const char *path, const u8 *uuid, u64 ctransid,
 		      void *user);
 	int (*snapshot)(const char *path, const u8 *uuid, u64 ctransid,

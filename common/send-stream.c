@@ -211,6 +211,8 @@ static int read_cmd(struct btrfs_send_stream *sctx)
 		error("crc32c mismatch in command");
 		goto out;
 	}
+	/* Leave the buffer a valid command for ops->cmd_raw. */
+	put_unaligned_le32(crc, &cmd_hdr->crc);
 
 	pos = 0;
 	while (pos < cmd_len) {
@@ -436,6 +438,16 @@ static int read_and_process_cmd(struct btrfs_send_stream *sctx)
 	ret = read_cmd(sctx);
 	if (ret)
 		goto out;
+
+	if (sctx->ops->cmd_raw) {
+		struct btrfs_cmd_header *hdr = (struct btrfs_cmd_header *)sctx->read_buf;
+
+		ret = sctx->ops->cmd_raw(sctx->read_buf,
+				sizeof(*hdr) + get_unaligned_le32(&hdr->len),
+				sctx->version, sctx->user);
+		if (ret)
+			goto out;
+	}
 
 	switch (sctx->cmd) {
 	case BTRFS_SEND_C_SUBVOL:

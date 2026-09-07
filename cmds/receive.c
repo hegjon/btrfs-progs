@@ -45,6 +45,7 @@
 #include <zstd.h>
 #endif
 #include "kernel-shared/uapi/btrfs.h"
+#include "kernel-shared/send.h"
 #include "common/defs.h"
 #include "common/messages.h"
 #include "common/utils.h"
@@ -55,6 +56,8 @@
 #include "common/string-utils.h"
 #include "cmds/commands.h"
 #include "cmds/receive-dump.h"
+#include <pthread.h>
+#include <signal.h>
 
 struct btrfs_receive
 {
@@ -99,6 +102,25 @@ struct btrfs_receive
 	bool skip_root_chown;
 	char **setgid_dirs;
 	int setgid_dirs_cnt;
+
+	/*
+	 * Worker: a second copy of this parser running on the read end of a
+	 * pipe. The data and attribute commands of a file this receive
+	 * created are copied into the pipe as they arrive and handled there,
+	 * by the same handlers, while this thread goes on creating the next
+	 * inodes. See pipe_route().
+	 */
+	bool pipe_workers;
+	bool pipe_running;
+	int pipe_wfd;
+	int pipe_rfd;
+	int pipe_ret;
+	pthread_t pipe_thread;
+	struct btrfs_receive *worker;
+	const void *cur_cmd;
+	size_t cur_cmd_len;
+	u32 stream_version;
+	char async_path[PATH_MAX];
 
 	bool honor_end_cmd;
 
@@ -176,6 +198,7 @@ out:
 }
 
 static int flush_pending(struct btrfs_receive *rctx);
+static int pipe_drain(struct btrfs_receive *rctx);
 static void close_inode_for_write(struct btrfs_receive *rctx);
 
 static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
@@ -188,6 +211,11 @@ static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 	ret = flush_pending(rctx);
 	if (ret < 0)
 		return ret;
+
+	ret = pipe_drain(rctx);
+	if (ret < 0)
+		return ret;
+	rctx->async_path[0] = 0;
 
 
 	ret = finish_subvol(rctx);
@@ -282,6 +310,11 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	ret = flush_pending(rctx);
 	if (ret < 0)
 		return ret;
+
+	ret = pipe_drain(rctx);
+	if (ret < 0)
+		return ret;
+	rctx->async_path[0] = 0;
 
 
 	ret = finish_subvol(rctx);
@@ -431,6 +464,165 @@ enum {
 	PENDING_SYMLINK,
 };
 
+static struct btrfs_send_ops send_ops;
+
+static int process_cmd_raw(const void *buf, size_t len, u32 version, void *user)
+{
+	struct btrfs_receive *rctx = user;
+
+	rctx->cur_cmd = buf;
+	rctx->cur_cmd_len = len;
+	rctx->stream_version = version;
+	return 0;
+}
+
+static int write_all(int fd, const void *buf, size_t len)
+{
+	size_t pos = 0;
+
+	while (pos < len) {
+		ssize_t n = write(fd, (const char *)buf + pos, len - pos);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		pos += n;
+	}
+	return 0;
+}
+
+static void *pipe_worker_main(void *arg)
+{
+	struct btrfs_receive *w = arg;
+
+	w->pipe_ret = btrfs_read_and_process_send_stream(w->pipe_rfd, &send_ops,
+							 w, 1, 1);
+	close_inode_for_write(w);
+	close(w->pipe_rfd);
+	w->pipe_rfd = -1;
+	return NULL;
+}
+
+static int pipe_start(struct btrfs_receive *rctx)
+{
+	struct btrfs_receive *w = rctx->worker;
+	struct btrfs_stream_header hdr;
+	int fds[2];
+	int ret;
+
+	if (!w) {
+		w = malloc(sizeof(*w));
+		if (!w)
+			return -ENOMEM;
+		rctx->worker = w;
+	}
+	if (pipe(fds))
+		return -errno;
+	fcntl(fds[1], F_SETPIPE_SZ, SZ_1M);
+
+	*w = *rctx;
+	w->write_fd = -1;
+	w->write_path[0] = 0;
+	w->pending_type = PENDING_NONE;
+	w->pipe_workers = false;
+	w->pipe_running = false;
+	w->pipe_wfd = -1;
+	w->pipe_rfd = fds[0];
+	w->pipe_ret = 0;
+	w->worker = NULL;
+	w->async_path[0] = 0;
+#if COMPRESSION_ZSTD
+	w->zstd_dstream = NULL;
+#endif
+	w->zlib_stream = NULL;
+	/* chown decisions are made here; the worker runs what it is sent. */
+	w->skip_root_chown = false;
+	w->setgid_dirs = NULL;
+	w->setgid_dirs_cnt = 0;
+
+	memcpy(hdr.magic, BTRFS_SEND_STREAM_MAGIC, sizeof(hdr.magic));
+	hdr.version = cpu_to_le32(rctx->stream_version);
+	ret = write_all(fds[1], &hdr, sizeof(hdr));
+	if (ret < 0)
+		goto fail;
+	if (pthread_create(&rctx->pipe_thread, NULL, pipe_worker_main, w)) {
+		ret = -errno;
+		error("cannot create receive worker thread: %m");
+		goto fail;
+	}
+	rctx->pipe_wfd = fds[1];
+	rctx->pipe_running = true;
+	return 0;
+fail:
+	close(fds[0]);
+	close(fds[1]);
+	return ret;
+}
+
+/* End the worker's stream and wait for it; returns its error, if any. */
+static int pipe_drain(struct btrfs_receive *rctx)
+{
+	struct btrfs_cmd_header end = {
+		.len = 0,
+		.cmd = cpu_to_le16(BTRFS_SEND_C_END),
+		.crc = 0,
+	};
+	int ret;
+
+	if (!rctx->pipe_running)
+		return 0;
+	put_unaligned_le32(crc32c(0, &end, sizeof(end)), &end.crc);
+	write_all(rctx->pipe_wfd, &end, sizeof(end));
+	close(rctx->pipe_wfd);
+	rctx->pipe_wfd = -1;
+	pthread_join(rctx->pipe_thread, NULL);
+	rctx->pipe_running = false;
+#if COMPRESSION_ZSTD
+	if (rctx->worker->zstd_dstream)
+		ZSTD_freeDStream(rctx->worker->zstd_dstream);
+#endif
+	if (rctx->worker->zlib_stream) {
+		inflateEnd(rctx->worker->zlib_stream);
+		free(rctx->worker->zlib_stream);
+	}
+	ret = rctx->worker->pipe_ret;
+	return ret < 0 ? ret : 0;
+}
+
+/* Forward the current command to the worker. */
+static int pipe_route(struct btrfs_receive *rctx)
+{
+	int ret;
+
+	if (!rctx->pipe_running) {
+		ret = pipe_start(rctx);
+		if (ret < 0)
+			return ret;
+	}
+	ret = write_all(rctx->pipe_wfd, rctx->cur_cmd, rctx->cur_cmd_len);
+	if (ret == -EPIPE) {
+		/* The worker is gone: its error is the one to report. */
+		ret = pipe_drain(rctx);
+		return ret < 0 ? ret : -EPIPE;
+	}
+	return ret;
+}
+
+static bool is_async_file(struct btrfs_receive *rctx, const char *path)
+{
+	return rctx->async_path[0] && strcmp(path, rctx->async_path) == 0;
+}
+
+/* Drain if a command by path would race the worker on that same file. */
+static int sync_async_file(struct btrfs_receive *rctx, const char *path)
+{
+	if (!is_async_file(rctx, path))
+		return 0;
+	return pipe_drain(rctx);
+}
+
 static const char *pending_name(int type)
 {
 	switch (type) {
@@ -472,10 +664,16 @@ static int create_inode(struct btrfs_receive *rctx, int type, const char *path,
 		ret = open(full_path, O_RDWR | O_CREAT | (excl ? O_EXCL : O_TRUNC),
 			   0600);
 		if (ret >= 0) {
-			close_inode_for_write(rctx);
-			rctx->write_fd = ret;
-			strncpy_null(rctx->write_path, full_path,
-				     sizeof(rctx->write_path));
+			if (rctx->pipe_workers) {
+				close(ret);
+				strncpy_null(rctx->async_path, path,
+					     sizeof(rctx->async_path));
+			} else {
+				close_inode_for_write(rctx);
+				rctx->write_fd = ret;
+				strncpy_null(rctx->write_path, full_path,
+					     sizeof(rctx->write_path));
+			}
 			ret = 0;
 		}
 		break;
@@ -691,6 +889,9 @@ static int process_rename(const char *from, const char *to, void *user)
 		if (ret < 0)
 			return ret;
 	}
+	ret = sync_async_file(rctx, to);
+	if (ret < 0)
+		return ret;
 
 	ret = path_cat_out(full_from, rctx->full_subvol_path, from);
 	if (ret < 0) {
@@ -711,6 +912,8 @@ static int process_rename(const char *from, const char *to, void *user)
 	if (ret < 0) {
 		ret = -errno;
 		error("rename %s -> %s failed: %m", from, to);
+	} else if (is_async_file(rctx, from)) {
+		strncpy_null(rctx->async_path, to, sizeof(rctx->async_path));
 	}
 
 out:
@@ -724,6 +927,13 @@ static int process_link(const char *path, const char *lnk, void *user)
 	char full_path[PATH_MAX];
 	char full_link_path[PATH_MAX];
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = sync_async_file(rctx, path);
+	if (ret < 0)
+		return ret;
+	ret = sync_async_file(rctx, lnk);
 	if (ret < 0)
 		return ret;
 
@@ -763,6 +973,10 @@ static int process_unlink(const char *path, void *user)
 	if (ret < 0)
 		return ret;
 
+	ret = sync_async_file(rctx, path);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -789,6 +1003,10 @@ static int process_rmdir(const char *path, void *user)
 	struct btrfs_receive *rctx = user;
 	char full_path[PATH_MAX];
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = sync_async_file(rctx, path);
 	if (ret < 0)
 		return ret;
 
@@ -856,6 +1074,9 @@ static int process_write(const char *path, const void *data, u64 offset,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -907,6 +1128,10 @@ static int process_clone(const char *path, u64 offset, u64 len,
 	char full_clone_path[PATH_MAX];
 	int clone_fd = -1;
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = pipe_drain(rctx);
 	if (ret < 0)
 		return ret;
 
@@ -1007,6 +1232,9 @@ static int process_set_xattr(const char *path, const char *name,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1041,6 +1269,10 @@ static int process_remove_xattr(const char *path, const char *name, void *user)
 	if (ret < 0)
 		return ret;
 
+	ret = sync_async_file(rctx, path);
+	if (ret < 0)
+		return ret;
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1072,6 +1304,9 @@ static int process_truncate(const char *path, u64 size, void *user)
 	ret = flush_pending(rctx);
 	if (ret < 0)
 		return ret;
+
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
 
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
@@ -1119,6 +1354,9 @@ static int process_chmod(const char *path, u64 mode, void *user)
 			goto out;
 	}
 
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
+
 	ret = chmod(full_path, mode);
 	if (ret < 0) {
 		ret = -errno;
@@ -1158,6 +1396,9 @@ static int process_chown(const char *path, u64 uid, u64 gid, void *user)
 		fprintf(stderr, "chown %s - uid=%llu, gid=%llu\n", path,
 				uid, gid);
 
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
+
 	ret = lchown(full_path, uid, gid);
 	if (ret < 0) {
 		ret = -errno;
@@ -1179,6 +1420,9 @@ static int process_utimes(const char *path, struct timespec *at,
 	ret = flush_pending(rctx);
 	if (ret < 0)
 		return ret;
+
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
 
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
@@ -1484,6 +1728,9 @@ static int process_encoded_write(const char *path, const void *data, u64 offset,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
+
 
 	if (bconf.verbose >= 3)
 		fprintf(stderr,
@@ -1537,6 +1784,9 @@ static int process_fallocate(const char *path, int mode, u64 offset, u64 len,
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
+
 
 	if (bconf.verbose >= 3)
 		fprintf(stderr,
@@ -1579,6 +1829,9 @@ static int process_fileattr(const char *path, u64 attr, void *user)
 	if (ret < 0)
 		return ret;
 
+	if (is_async_file(rctx, path))
+		return pipe_route(rctx);
+
 
 	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
 	if (ret < 0) {
@@ -1613,6 +1866,10 @@ static int process_enable_verity(const char *path, u8 algorithm, u32 block_size,
 		.block_size = block_size,
 	};
 	ret = flush_pending(rctx);
+	if (ret < 0)
+		return ret;
+
+	ret = sync_async_file(rctx, path);
 	if (ret < 0)
 		return ret;
 
@@ -1669,6 +1926,7 @@ static int process_enable_verity(const char *path, u8 algorithm, u32 block_size,
 #endif
 
 static struct btrfs_send_ops send_ops = {
+	.cmd_raw = process_cmd_raw,
 	.subvol = process_subvol,
 	.snapshot = process_snapshot,
 	.mkfile = process_mkfile,
@@ -1826,6 +2084,10 @@ static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
 		ret = flush_pending(rctx);
 		if (ret < 0)
 			goto out;
+		ret = pipe_drain(rctx);
+		if (ret < 0)
+			goto out;
+		rctx->async_path[0] = 0;
 		close_inode_for_write(rctx);
 		ret = finish_subvol(rctx);
 		if (ret < 0)
@@ -1836,6 +2098,10 @@ static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
 	ret = 0;
 
 out:
+	if (rctx->pipe_running)
+		pipe_drain(rctx);
+	free(rctx->worker);
+	rctx->worker = NULL;
 	if (rctx->write_fd != -1) {
 		close(rctx->write_fd);
 		rctx->write_fd = -1;
@@ -1933,6 +2199,12 @@ static int cmd_receive(const struct cmd_struct *cmd, int argc, char **argv)
 	rctx.dest_dir_fd = -1;
 	rctx.dest_dir_chroot = false;
 	rctx.pending_type = PENDING_NONE;
+	rctx.pipe_wfd = -1;
+	rctx.pipe_rfd = -1;
+	rctx.pipe_workers = !getenv("BTRFS_RECEIVE_WORKERS") ||
+			    atoi(getenv("BTRFS_RECEIVE_WORKERS")) > 0;
+	if (rctx.pipe_workers)
+		signal(SIGPIPE, SIG_IGN);
 	rctx.skip_root_chown = geteuid() == 0 && getegid() == 0;
 	realmnt[0] = 0;
 	fromfile[0] = 0;
